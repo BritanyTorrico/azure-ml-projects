@@ -1,0 +1,338 @@
+# conectar al workspace
+from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
+from azure.ai.ml import MLClient
+
+try:
+    credential = DefaultAzureCredential()
+    # Check if given credential can get token successfully.
+    credential.get_token("https://management.azure.com/.default")
+except Exception as ex:
+    # Fall back to InteractiveBrowserCredential in case DefaultAzureCredential not work
+    credential = InteractiveBrowserCredential()
+# Get a handle to workspace
+ml_client = MLClient.from_config(credential=credential)
+
+#crear los scripts
+import os
+
+# create a folder for the script files
+script_folder = 'src'
+os.makedirs(script_folder, exist_ok=True)
+print(script_folder, 'folder created')
+
+#preparar los datos
+%%writefile $script_folder/prep-data.py
+# importar librerías
+import argparse
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+
+def main(args):
+    # leer datos
+    df = get_data(args.input_data)
+
+    cleaned_data = clean_data(df)
+
+    prepared_data = preprocess_data(cleaned_data)
+    
+    output_df = prepared_data.to_csv((Path(args.output_data) / "obesity.csv"), index=False)
+
+# función que lee los datos
+def get_data(path):
+    df = pd.read_csv(path)
+
+    # Contar las filas e imprimir el resultado
+    row_count = len(df)
+    print('Preparando {} filas de datos'.format(row_count))
+    
+    return df
+
+# función que elimina valores nulos
+def clean_data(df):
+    df = df.dropna()
+    return df
+
+# función que preprocesa los datos
+def preprocess_data(df):
+    # Definir las columnas numéricas y categóricas
+    numeric_features = ['Age', 'Height', 'Weight', 'FCVC', 'NCP', 'CH2O', 'FAF', 'TUE']
+    categorical_features = ['Gender', 'family_history_with_overweight', 'FAVC', 'CAEC', 'SMOKE', 'SCC', 'CALC', 'MTRANS']
+
+    # Definir los pasos del pipeline para las características numéricas
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', MinMaxScaler())])
+
+    # Definir los pasos del pipeline para las características categóricas
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))])
+
+    # Combinar los pasos del pipeline
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)])
+
+    # Aplicar el preprocesamiento al DataFrame
+    X_prepared = preprocessor.fit_transform(df)
+    
+    # Obtener los nombres de las características transformadas para las columnas categóricas
+    cat_encoder = preprocessor.named_transformers_['cat']['onehot']
+    
+    # Construir los nombres de las características categóricas transformadas manualmente
+    cat_feature_names = []
+    for cat_feature in cat_encoder.categories_:
+        cat_feature_names.extend([f"{cat_feature}_{value}" for value in cat_feature])
+    
+    # Combinar los nombres de las características numéricas y categóricas
+    all_feature_names = numeric_features + cat_feature_names
+
+    # Convertir los datos transformados a un DataFrame con los nombres de las columnas adecuadas
+    X_prepared_df = pd.DataFrame(X_prepared, columns=all_feature_names)
+    
+    # Añadir la columna de destino 'NObeyesdad' al DataFrame preprocesado
+    X_prepared_df['NObeyesdad'] = df['NObeyesdad'].values
+    
+    return X_prepared_df
+
+
+def parse_args():
+    # setup arg parser
+    parser = argparse.ArgumentParser()
+
+    # add arguments
+    parser.add_argument("--input_data", dest='input_data', type=str)
+    parser.add_argument("--output_data", dest='output_data', type=str)
+
+    # parse args
+    args = parser.parse_args()
+
+    # return args
+    return args
+
+# ejecutar script
+if __name__ == "__main__":
+    # añadir espacio en los registros
+    print("\n\n")
+    print("*" * 60)
+
+    # analizar argumentos
+    args = parse_args()
+
+    # ejecutar función principal
+    main(args)
+
+    # añadir espacio en los registros
+    print("*" * 60)
+    print("\n\n")
+
+#entrenar el modelo
+
+%%writefile $script_folder/train-model.py
+# importar librerías
+
+import mlflow
+import mlflow.sklearn
+import argparse
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
+import glob
+import os
+
+def main(args):
+    # enable autologging
+    #mlflow.autolog()
+    mlflow.sklearn.autolog()
+    # leer datos
+    df = get_data(args.training_data)
+
+    # dividir datos
+    X_train, X_test, y_train, y_test = split_data(df)
+    #entrenar modelo
+    model = train_model(X_train, y_train)
+
+    # evaluar modelo
+    eval_model(model, X_test, y_test)
+
+# función que lee los datos
+def get_data(data_path):
+    all_files = glob.glob(data_path + "/*.csv")
+    df = pd.concat((pd.read_csv(f) for f in all_files), sort=False)
+    return df
+
+# función que divide los datos
+def split_data(df):
+    print("Dividiendo datos...")
+    X = df.drop(columns=["NObeyesdad"])
+    y = df["NObeyesdad"]
+    
+    # codificar variables categóricas
+    X = pd.get_dummies(X)
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    
+    return X_train, X_test, y_train, y_test
+
+# función que entrena el modelo
+def train_model(X_train, y_train, ):
+    print("Entrenando modelo...")
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    mlflow.sklearn.save_model(model, args.model_output)
+    return model
+
+# función que evalúa el modelo
+def eval_model(model, X_test, y_test):
+    print("Evaluando modelo...")
+    # calcular precisión
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    print('Precisión:', acc)
+   
+    
+    # calcular AUC-ROC
+    y_probs = model.predict_proba(X_test)
+    auc = roc_auc_score(y_test, y_probs, multi_class='ovr')  # Para multiclase
+    print('AUC-ROC:', auc)
+    
+
+    # Calcular F1-score
+    f1 = f1_score(y_test, y_pred, average='macro')  # O 'micro' si prefieres
+    print('F1-score:', f1)
+  
+
+    # Calcular precisión y recall
+    precision = precision_score(y_test, y_pred, average='macro')  # O 'micro' si prefieres
+    recall = recall_score(y_test, y_pred, average='macro')  # O 'micro' si prefieres
+    print('Precisión:', precision)
+    print('Recall:', recall)
+  
+
+def parse_args():
+    # setup arg parser
+    parser = argparse.ArgumentParser()
+
+    # add arguments
+    parser.add_argument("--training_data", dest='training_data',
+                        type=str)
+    parser.add_argument("--model_output", dest='model_output',
+                        type=str)
+    # parse args
+    args = parser.parse_args()
+
+    # return args
+    return args
+
+# ejecutar el script
+if __name__ == "__main__":
+    # añadir espacio en los registros
+    print("\n\n")
+    print("*" * 60)
+
+    # analizar argumentos
+    args = parse_args()
+
+    # ejecutar función principal
+    main(args)
+
+    # añadir espacio en los registros
+    print("*" * 60)
+    print("\n\n")
+
+
+
+# definir los componentes
+%%writefile prep-data.yml
+$schema: https://azuremlschemas.azureedge.net/latest/commandComponent.schema.json
+name: prep_data
+display_name: Prepare training data
+version: 1
+type: command
+inputs:
+  input_data: 
+    type: uri_file
+outputs:
+  output_data:
+    type: uri_folder
+code: ./src
+environment: azureml:AzureML-sklearn-0.24-ubuntu18.04-py37-cpu@latest
+command: >-
+  python prep-data.py 
+  --input_data ${{inputs.input_data}}
+  --output_data ${{outputs.output_data}}
+
+
+%%writefile train-model.yml
+$schema: https://azuremlschemas.azureedge.net/latest/commandComponent.schema.json
+name: train_model
+display_name: Train a decision tree classifier model
+version: 1
+type: command
+inputs:
+  training_data: 
+    type: uri_folder
+outputs:
+  model_output:
+    type: mlflow_model
+code: ./src
+environment: azureml:AzureML-sklearn-0.24-ubuntu18.04-py37-cpu@latest
+command: >-
+  python train-model.py 
+  --training_data ${{inputs.training_data}} 
+  --model_output ${{outputs.model_output}} 
+
+#cargar los componentes
+from azure.ai.ml import load_component
+parent_dir = ""
+
+prep_data = load_component(source=parent_dir + "./prep-data.yml")
+train_decision_tree = load_component(source=parent_dir + "./train-model.yml")
+
+#construir el pipeline
+from azure.ai.ml import Input
+from azure.ai.ml.constants import AssetTypes
+from azure.ai.ml.dsl import pipeline
+
+@pipeline()
+def obesity_classification(pipeline_job_input):
+    clean_data = prep_data(input_data=pipeline_job_input)
+    train_model = train_decision_tree(training_data=clean_data.outputs.output_data)
+
+    return {
+        "pipeline_job_transformed_data": clean_data.outputs.output_data,
+        "pipeline_job_trained_model": train_model.outputs.model_output,
+    }
+
+pipeline_job = obesity_classification(Input(type=AssetTypes.URI_FILE, path="azureml:obesity-data:1"))
+
+#configuracion de parametros del pipeline
+# change the output mode
+pipeline_job.outputs.pipeline_job_transformed_data.mode = "upload"
+pipeline_job.outputs.pipeline_job_trained_model.mode = "upload"
+# set pipeline level compute
+pipeline_job.settings.default_compute = "aml-cluster"
+# set pipeline level datastore
+pipeline_job.settings.default_datastore = "workspaceblobstore"
+
+# print the pipeline job again to review the changes
+print(pipeline_job)
+
+
+#guardar el pipeline job
+
+# submit job to workspace
+pipeline_job = ml_client.jobs.create_or_update(
+    pipeline_job, experiment_name="pipeline_obesityAutologinSkit2"
+)
+pipeline_job
+
+#registrar el modelo 

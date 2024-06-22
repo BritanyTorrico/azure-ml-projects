@@ -4,4 +4,3 @@ pandas
 numpy
 matplotlib
 azure-ai-ml
-azure-identity
